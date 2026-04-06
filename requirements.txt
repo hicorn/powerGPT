@@ -8,8 +8,6 @@ transformers>=4.35.0  # for tokenizer only (optional, we use tiktoken)
 accelerate>=0.24.0
 bitsandbytes>=0.41.0  # for 4-bit quantization (optional)
 
-# Distributed training
-torchdistx>=0.1.0  # optional, for advanced distributed ops
 
 # Logging & monitoring
 tensorboard>=2.13.0
@@ -45,4 +43,3 @@ flake8>=6.1.0
 mypy>=1.5.0
 
 # Optional: FlashAttention-2 (requires CUDA 11.6+)
-# flash-attn>=2.3.0 - install separately: pip install flash-attn --no-build-isolation

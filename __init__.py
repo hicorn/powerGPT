@@ -1,0 +1,22 @@
+"""
+PowerGPT - Optimized GPT training from scratch for T4 GPU.
+"""
+
+from .config import ConfigManager, ModelArchConfig, TrainingConfig, InferenceConfig
+from .model import GPT
+from .trainer import Trainer
+from .data_pipeline import create_dataloaders, TokenizerWrapper, MMapTokenizedDataset
+from .utils import set_seed, get_rank, is_main_process, save_checkpoint, load_checkpoint
+from .optimizer import create_optimizer, get_lr_schedule
+from .eval import evaluate_loss, generate_samples
+from .benchmark import Benchmarker
+from .cli import main as cli_main
+
+__version__ = "1.0.0"
+__all__ = [
+    "ConfigManager", "ModelArchConfig", "TrainingConfig", "InferenceConfig",
+    "GPT", "Trainer", "create_dataloaders", "TokenizerWrapper", "MMapTokenizedDataset",
+    "set_seed", "get_rank", "is_main_process", "save_checkpoint", "load_checkpoint",
+    "create_optimizer", "get_lr_schedule", "evaluate_loss", "generate_samples",
+    "Benchmarker", "cli_main",
+]

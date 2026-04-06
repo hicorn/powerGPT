@@ -2,7 +2,7 @@
 
 
 
-Modern GPT implementation from scratch. Not a fork. Not a toy.\*\*
+Modern GPT implementation from scratch. Not a fork. Not a toy.
 
 
 
@@ -60,7 +60,7 @@ pip install -e .
 
 
 
-Train on Shakespeare (sanity check)\*\*
+Train on Shakespeare (sanity check)
 
 
 
@@ -110,7 +110,7 @@ python powergpt benchmark --checkpoint checkpoints/best.pt --batch\_sizes 1,2,4,
 
 
 
-\*\*Export to ONNX / TensorRT\*\*
+Export to ONNX / TensorRT
 
 
 
@@ -138,7 +138,7 @@ pip install torch numpy tiktoken wandb tensorboard pyyaml
 
 
 
-\*\*Optional:\*\*
+Optional:
 
 \- `flash-attn` — FlashAttention-2 (strongly recommended)
 
@@ -168,7 +168,7 @@ python powergpt train --config configs/gpt2\_124m.yaml
 
 
 
-With DDP on 8 GPUs:\*\*
+With DDP on 8 GPU
 
 
 

@@ -5,10 +5,15 @@ Mixture of Experts, KV cache with sliding window, and gradient checkpointing.
 
 import math
 from typing import Optional, Tuple, List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Импорт конфигурации из правильного модуля
+from .config import ModelArchConfig
+
+# FlashAttention import с graceful fallback
 try:
     from flash_attn import flash_attn_func
     FLASH_ATTENTION_AVAILABLE = True
@@ -16,36 +21,47 @@ except ImportError:
     FLASH_ATTENTION_AVAILABLE = False
     print("[INFO] FlashAttention not installed. Using manual attention.")
 
-from .config import ModelArchConfig
-
 
 # -----------------------------------------------------------------------------
-# Core building blocks
+# Core building blocks: RMSNorm, LayerNorm, RoPE, Activations
 # -----------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (faster than LayerNorm)."""
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
         return self.weight * (x / rms)
 
+
 class LayerNorm(nn.Module):
+    """Standard LayerNorm with bias option."""
     def __init__(self, dim: int, bias: bool = True, eps: float = 1e-5):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.bias = nn.Parameter(torch.zeros(dim)) if bias else None
         self.eps = eps
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.layer_norm(x, self.weight.shape, self.weight, self.bias, self.eps)
 
-def rotate_half(x):
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate half the hidden dims for RoPE."""
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
-def apply_rotary_pos_emb(q, k, cos, sin):
+
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor,
+                         cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary positional embeddings to query and key.
+    Supports both (B, T, nh, hd) and (B, nh, T, hd) layouts.
+    """
     if q.dim() == 4 and q.shape[2] == cos.shape[2]:
         cos = cos.transpose(1, 2)
         sin = sin.transpose(1, 2)
@@ -53,7 +69,9 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+
 class RotaryEmbedding(nn.Module):
+    """Rotary Positional Embeddings with FP32 computation for numerical stability."""
     def __init__(self, dim: int, max_seq_len: int = 4096, base: float = 10000.0):
         super().__init__()
         self.dim = dim
@@ -64,7 +82,8 @@ class RotaryEmbedding(nn.Module):
         self._seq_len_cached = 0
         self._cos_cached = None
         self._sin_cached = None
-    def _update_cache(self, seq_len, device, dtype):
+
+    def _update_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
         if seq_len <= self._seq_len_cached:
             return
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
@@ -75,7 +94,8 @@ class RotaryEmbedding(nn.Module):
         self._cos_cached = cos
         self._sin_cached = sin
         self._seq_len_cached = seq_len
-    def forward(self, q, k, seq_len):
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         self._update_cache(seq_len, q.device, q.dtype)
         if q.dim() == 4 and q.shape[2] == seq_len:
             cos = self._cos_cached.transpose(1, 2)
@@ -85,22 +105,28 @@ class RotaryEmbedding(nn.Module):
             sin = self._sin_cached
         return cos, sin
 
+
 class SwiGLU(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int = None, bias: bool = True):
+    """SwiGLU activation: Swish(xW1) * (xW2) then projection."""
+    def __init__(self, dim: int, hidden_dim: Optional[int] = None, bias: bool = True):
         super().__init__()
         hidden_dim = hidden_dim or 4 * dim
         self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
         self.w2 = nn.Linear(dim, hidden_dim, bias=bias)
         self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
+
 class GELU(nn.Module):
-    def forward(self, x):
+    """GELU activation (legacy, slower than SwiGLU)."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.gelu(x)
 
+
 # -----------------------------------------------------------------------------
-# Mixture of Experts
+# Mixture of Experts (MoE) layer with load balancing
 # -----------------------------------------------------------------------------
 
 class MoERouter(nn.Module):
@@ -110,27 +136,36 @@ class MoERouter(nn.Module):
         self.top_k = top_k
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.router_scale = nn.Parameter(torch.ones(1))
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         logits = self.gate(x) * self.router_scale
         weights, indices = torch.topk(logits, self.top_k, dim=-1)
         weights = F.softmax(weights, dim=-1)
         return weights, indices
 
+
 class MoELayer(nn.Module):
-    def __init__(self, dim: int, num_experts: int, top_k: int, hidden_dim: int = None, bias: bool = True):
+    def __init__(self, dim: int, num_experts: int, top_k: int,
+                 hidden_dim: Optional[int] = None, bias: bool = True):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.router = MoERouter(dim, num_experts, top_k)
-        self.experts = nn.ModuleList([SwiGLU(dim, hidden_dim, bias) for _ in range(num_experts)])
+        self.experts = nn.ModuleList([
+            SwiGLU(dim, hidden_dim, bias) for _ in range(num_experts)
+        ])
         self.register_buffer("expert_counts", torch.zeros(num_experts))
         self.load_balance_loss = torch.tensor(0.0, requires_grad=True)
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
         x_flat = x.view(B * T, C)
         router_weights, expert_indices = self.router(x_flat)
         self.expert_counts.zero_()
-        self.expert_counts.scatter_add_(0, expert_indices.view(-1), torch.ones_like(expert_indices.view(-1), dtype=torch.float))
+        self.expert_counts.scatter_add_(
+            0, expert_indices.view(-1),
+            torch.ones_like(expert_indices.view(-1), dtype=torch.float)
+        )
         y_flat = torch.zeros_like(x_flat)
         for expert_idx in range(self.num_experts):
             mask = (expert_indices == expert_idx).any(dim=-1)
@@ -145,6 +180,7 @@ class MoELayer(nn.Module):
         router_probs = torch.softmax(self.router.gate.weight, dim=-1).mean(0)
         self.load_balance_loss = torch.sum(fraction_per_expert * router_probs) * self.num_experts
         return y_flat.view(B, T, C)
+
 
 # -----------------------------------------------------------------------------
 # FlashAttention with KV cache
@@ -166,7 +202,11 @@ class FlashAttention(nn.Module):
             self.rope = RotaryEmbedding(self.head_dim, max_seq_len=config.block_size, base=config.rope_theta)
         else:
             self.rope = None
-    def forward(self, x, past_kv=None, use_cache=False, attention_mask=None):
+
+    def forward(self, x: torch.Tensor,
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache: bool = False,
+                attention_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = x.shape
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim)
         k = self.k_proj(x).view(B, T, self.n_head, self.head_dim)
@@ -180,7 +220,9 @@ class FlashAttention(nn.Module):
             v = torch.cat([past_v, v], dim=1)
         new_kv = (k, v) if use_cache else None
         if self.flash:
-            attn_out = flash_attn_func(q, k, v, dropout_p=self.dropout if self.training else 0.0, causal=True)
+            attn_out = flash_attn_func(q, k, v,
+                                       dropout_p=self.dropout if self.training else 0.0,
+                                       causal=True)
         else:
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
@@ -188,13 +230,16 @@ class FlashAttention(nn.Module):
             scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
             causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool)).view(1, 1, T, T)
             scores = scores.masked_fill(~causal_mask, float('-inf'))
+            if attention_mask is not None:
+                scores = scores + attention_mask
             attn_weights = F.softmax(scores, dim=-1)
             attn_weights = F.dropout(attn_weights, p=self.dropout if self.training else 0.0)
             attn_out = (attn_weights @ v).transpose(1, 2).reshape(B, T, C)
         return self.out_proj(attn_out), new_kv
 
+
 # -----------------------------------------------------------------------------
-# Transformer Block
+# Transformer Block (supports both regular MLP and MoE)
 # -----------------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
@@ -220,12 +265,16 @@ class TransformerBlock(nn.Module):
                 )
         self.dropout = nn.Dropout(config.dropout)
         self.layer_idx = layer_idx
-    def forward(self, x, past_kv=None, use_cache=False):
+
+    def forward(self, x: torch.Tensor,
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache: bool = False) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         attn_out, new_kv = self.attn(self.norm1(x), past_kv=past_kv, use_cache=use_cache)
         x = x + self.dropout(attn_out)
         mlp_out = self.mlp(self.norm2(x))
         x = x + self.dropout(mlp_out)
         return x, new_kv
+
 
 # -----------------------------------------------------------------------------
 # Full GPT Model
@@ -248,7 +297,8 @@ class GPT(nn.Module):
         for name, param in self.named_parameters():
             if 'c_proj.weight' in name or 'w3.weight' in name:
                 torch.nn.init.normal_(param, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
-    def _init_weights(self, module):
+
+    def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -259,7 +309,10 @@ class GPT(nn.Module):
             if hasattr(module, 'bias') and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
-    def forward(self, idx, targets=None, past_kv=None, use_cache=False):
+
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None,
+                past_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         B, T = idx.shape
         x = self.token_embedding(idx)
         if not self.config.use_rope:
@@ -286,39 +339,31 @@ class GPT(nn.Module):
         return logits, loss, new_past_kv if use_cache else None
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=0, top_p=1.0,
-                 repetition_penalty=1.0, use_kv_cache=True, max_kv_cache_tokens=2048):
-        """
-        Autoregressive generation with sliding-window KV cache.
-        When cache exceeds max_kv_cache_tokens, oldest tokens are discarded.
-        """
+    def generate(self, idx: torch.Tensor, max_new_tokens: int,
+                 temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0,
+                 repetition_penalty: float = 1.0, use_kv_cache: bool = True,
+                 max_kv_cache_tokens: int = 2048) -> torch.Tensor:
         self.eval()
         past_kv = [] if use_kv_cache else None
-        # We'll track total length to know when to trim
         current_len = idx.size(1)
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             logits, _, past_kv_out = self.forward(idx_cond, past_kv=past_kv, use_cache=use_kv_cache)
             if use_kv_cache:
                 past_kv = past_kv_out
-                # Update current length (number of tokens in cache)
                 current_len = idx_cond.size(1)
-                # Trim cache if exceeds limit - keep only the most recent max_kv_cache_tokens
                 if current_len > max_kv_cache_tokens:
                     trim_len = current_len - max_kv_cache_tokens
                     past_kv = [(k[:, trim_len:], v[:, trim_len:]) for k, v in past_kv]
                     current_len = max_kv_cache_tokens
             logits = logits[:, -1, :] / temperature
-            # Repetition penalty
             if repetition_penalty != 1.0:
                 for i in range(idx.shape[0]):
                     for token in set(idx[i].tolist()):
                         logits[i, token] /= repetition_penalty
-            # Top-k
             if top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            # Top-p
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
@@ -334,9 +379,12 @@ class GPT(nn.Module):
 
     def gradient_checkpointing_enable(self):
         self._gradient_checkpointing = True
+
     def gradient_checkpointing_disable(self):
         self._gradient_checkpointing = False
-    def configure_optimizers(self, weight_decay, learning_rate, betas, optimizer_type='adamw'):
+
+    def configure_optimizers(self, weight_decay: float, learning_rate: float,
+                             betas: Tuple[float, float], optimizer_type: str = 'adamw'):
         decay_params = []
         no_decay_params = []
         for name, param in self.named_parameters():

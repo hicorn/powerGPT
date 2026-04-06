@@ -50,7 +50,7 @@ Runs faster than nanoGPT and does more.
 
 ```bash
 
-git clone https://github.com/hicorn/powerGPT
+git clone https://github.com/your-repo/powergpt
 
 cd powergpt
 

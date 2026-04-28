@@ -1,3 +1,22 @@
+⚠️ CRITICAL BUG FIXED (Apr 28, 2026)
+
+If you cloned the repository before April 28, 2026 — `git pull` immediately.
+
+ What was broken:
+`trainer.py` referenced `training.gradient_checkpointing`, but this field lives in `model.gradient_checkpointing`. Training would crash with `AttributeError` on the first iteration.
+
+ What is fixed:
+- Single-line fix in `trainer.py` (line ~95): `self.config.training.gradient_checkpointing` → `self.config.model.gradient_checkpointing`
+- All comments, docstrings, and dead code stripped across the entire codebase
+- LoRA now applies **before** FSDP/DDP wrapping (correct order)
+- Clean `git history` without junk
+
+ How to update:
+```bash
+cd powerGPT
+git pull origin main
+pip install -e . --force-reinstall
+
 &#x20;PowerGPT
 
 

@@ -1,18 +1,10 @@
-"""
-Export trained models to production formats: TorchScript, ONNX, TensorRT.
-"""
-
 import os
 import warnings
 from typing import Optional, List, Dict, Any
-
 import torch
 import torch.nn as nn
-
 from .config import ModelArchConfig
 from .model import GPT
-
-
 def export_to_torchscript_trace(model, example_input, output_path, optimize=True):
     model.eval()
     original_device = next(model.parameters()).device
@@ -30,7 +22,6 @@ def export_to_torchscript_trace(model, example_input, output_path, optimize=True
     model = model.to(original_device)
     print(f"[INFO] Exported TorchScript to {output_path}")
     return output_path
-
 def export_to_torchscript_script(model, output_path, optimize=True):
     model.eval()
     original_device = next(model.parameters()).device
@@ -46,7 +37,6 @@ def export_to_torchscript_script(model, output_path, optimize=True):
     model = model.to(original_device)
     print(f"[INFO] Exported TorchScript to {output_path}")
     return output_path
-
 def export_to_torchscript(model, example_input, output_path, method='trace', optimize=True):
     if method == 'trace':
         return export_to_torchscript_trace(model, example_input, output_path, optimize)
@@ -54,7 +44,6 @@ def export_to_torchscript(model, example_input, output_path, method='trace', opt
         return export_to_torchscript_script(model, output_path, optimize)
     else:
         raise ValueError(f"Unknown method: {method}")
-
 def export_to_onnx(model, example_input, output_path, opset_version=14, do_constant_folding=True,
                    dynamic_axes=None, use_fp16=False):
     model.eval()
@@ -88,9 +77,7 @@ def export_to_onnx(model, example_input, output_path, opset_version=14, do_const
         _convert_onnx_to_fp16(output_path, output_fp16)
         return output_fp16
     return output_path
-
 def _convert_onnx_to_fp16(input_path, output_path):
-    """Convert ONNX model to FP16 with graceful fallback."""
     try:
         import onnx
         from onnxruntime.transformers.float16 import convert_float_to_float16
@@ -102,7 +89,6 @@ def _convert_onnx_to_fp16(input_path, output_path):
         print(f"[WARN] Cannot convert ONNX to FP16: {e}. Install onnxruntime-gpu.")
     except Exception as e:
         print(f"[WARN] FP16 conversion failed: {e}")
-
 def export_to_tensorrt(model, example_input, output_path, fp16=True, int8=False, workspace_size=1<<30):
     try:
         from torch2trt import torch2trt
@@ -120,7 +106,6 @@ def export_to_tensorrt(model, example_input, output_path, fp16=True, int8=False,
     except ImportError:
         print("[WARN] torch2trt not installed. Install with: git clone https://github.com/NVIDIA-AI-IOT/torch2trt")
         return None
-
 def quantize_dynamic(model, output_path):
     model.eval()
     model = model.cpu()
@@ -132,7 +117,6 @@ def quantize_dynamic(model, output_path):
     model.config.flash_attention = original_flash
     print(f"[INFO] Exported dynamically quantized model to {output_path}")
     return output_path
-
 class Exporter:
     def __init__(self, model, config):
         self.model = model

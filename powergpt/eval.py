@@ -1,31 +1,13 @@
-"""
-Evaluation utilities for PowerGPT.
-
-Includes:
-- Perplexity computation on validation sets
-- Text generation quality evaluation
-- Benchmarking against reference metrics
-- Distributed evaluation support
-- Logging evaluation results
-"""
-
 import math
 import time
 from typing import Optional, List, Dict, Any, Tuple, Callable
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-
 from .utils import (
     get_rank, get_world_size, is_main_process, all_reduce,
     compute_perplexity, compute_accuracy, log_metrics, Timer
 )
-
-
-# -----------------------------------------------------------------------------
-# Loss evaluation
-# -----------------------------------------------------------------------------
-
 @torch.no_grad()
 def evaluate_loss(
     model: nn.Module,
@@ -35,23 +17,8 @@ def evaluate_loss(
     eval_iters: int = 200,
     distributed: bool = False
 ) -> float:
-    """
-    Evaluate average loss on validation dataset.
-    
-    Args:
-        model: PyTorch model
-        dataloader: DataLoader for validation data
-        ctx: Mixed precision context
-        device: Device to run evaluation on
-        eval_iters: Number of batches to evaluate
-        distributed: Whether to sync across processes
-    
-    Returns:
-        mean_loss: Average cross-entropy loss
-    """
     model.eval()
     losses = []
-    
     for i, (x, y) in enumerate(dataloader):
         if i >= eval_iters:
             break
@@ -59,22 +26,15 @@ def evaluate_loss(
         with ctx:
             _, loss, _ = model(x, y)
         losses.append(loss.item())
-    
     if not losses:
         return float('inf')
-    
     mean_loss = sum(losses) / len(losses)
-    
-    # Sync across processes if distributed
     if distributed:
         loss_tensor = torch.tensor(mean_loss, device=device)
         all_reduce(loss_tensor, op='avg')
         mean_loss = loss_tensor.item()
-    
     model.train()
     return mean_loss
-
-
 @torch.no_grad()
 def evaluate_perplexity(
     model: nn.Module,
@@ -84,16 +44,8 @@ def evaluate_perplexity(
     eval_iters: int = 200,
     distributed: bool = False
 ) -> float:
-    """
-    Evaluate perplexity on validation dataset.
-    
-    Returns:
-        perplexity: exp(loss)
-    """
     loss = evaluate_loss(model, dataloader, ctx, device, eval_iters, distributed)
     return compute_perplexity(loss)
-
-
 @torch.no_grad()
 def evaluate_accuracy(
     model: nn.Module,
@@ -103,16 +55,9 @@ def evaluate_accuracy(
     eval_iters: int = 200,
     distributed: bool = False
 ) -> float:
-    """
-    Evaluate token-level accuracy on validation dataset.
-    
-    Returns:
-        accuracy: float between 0 and 1
-    """
     model.eval()
     correct = 0
     total = 0
-    
     for i, (x, y) in enumerate(dataloader):
         if i >= eval_iters:
             break
@@ -122,22 +67,15 @@ def evaluate_accuracy(
         predictions = logits.argmax(dim=-1)
         correct += (predictions == y).sum().item()
         total += y.numel()
-    
     if total == 0:
         return 0.0
-    
     accuracy = correct / total
-    
-    # Sync across processes if distributed
     if distributed:
         acc_tensor = torch.tensor(accuracy, device=device)
         all_reduce(acc_tensor, op='avg')
         accuracy = acc_tensor.item()
-    
     model.train()
     return accuracy
-
-
 @torch.no_grad()
 def evaluate_all_metrics(
     model: nn.Module,
@@ -147,27 +85,14 @@ def evaluate_all_metrics(
     eval_iters: int = 200,
     distributed: bool = False
 ) -> Dict[str, float]:
-    """
-    Evaluate all metrics (loss, perplexity, accuracy).
-    
-    Returns:
-        Dictionary with 'loss', 'perplexity', 'accuracy'
-    """
     loss = evaluate_loss(model, dataloader, ctx, device, eval_iters, distributed)
     perplexity = compute_perplexity(loss)
     accuracy = evaluate_accuracy(model, dataloader, ctx, device, eval_iters, distributed)
-    
     return {
         'loss': loss,
         'perplexity': perplexity,
         'accuracy': accuracy,
     }
-
-
-# -----------------------------------------------------------------------------
-# Generation evaluation
-# -----------------------------------------------------------------------------
-
 @torch.no_grad()
 def generate_samples(
     model: nn.Module,
@@ -181,36 +106,13 @@ def generate_samples(
     use_kv_cache: bool = True,
     device: torch.device = None
 ) -> List[str]:
-    """
-    Generate text samples from prompts.
-    
-    Args:
-        model: PyTorch model
-        tokenizer: Tokenizer for encoding/decoding
-        prompts: List of input prompts
-        max_new_tokens: Maximum tokens to generate
-        temperature: Sampling temperature
-        top_k: Top-k sampling parameter
-        top_p: Nucleus sampling parameter
-        repetition_penalty: Penalty for token repetition
-        use_kv_cache: Enable KV cache for faster generation
-        device: Device to run generation on
-    
-    Returns:
-        generated_texts: List of generated completions
-    """
     if device is None:
         device = next(model.parameters()).device
-    
     model.eval()
     generated_texts = []
-    
     for prompt in prompts:
-        # Encode prompt
         input_ids = tokenizer.encode(prompt)
         input_tensor = torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0)
-        
-        # Generate
         output_ids = model.generate(
             input_tensor,
             max_new_tokens=max_new_tokens,
@@ -220,20 +122,14 @@ def generate_samples(
             repetition_penalty=repetition_penalty,
             use_kv_cache=use_kv_cache,
         )
-        
-        # Decode and extract completion
         full_text = tokenizer.decode(output_ids[0].tolist())
-        # Remove prompt from output if it's included
         if full_text.startswith(prompt):
             completion = full_text[len(prompt):]
         else:
             completion = full_text
         generated_texts.append(completion)
-    
     model.train()
     return generated_texts
-
-
 def evaluate_generation_quality(
     model: nn.Module,
     tokenizer,
@@ -245,30 +141,11 @@ def evaluate_generation_quality(
     repetition_penalty: float = 1.1,
     device: torch.device = None
 ) -> Dict[str, float]:
-    """
-    Evaluate generation quality using simple heuristics.
-    
-    Args:
-        model: PyTorch model
-        tokenizer: Tokenizer for encoding/decoding
-        test_prompts: List of (prompt, expected_continuation) pairs
-        max_new_tokens: Maximum tokens to generate
-        temperature: Sampling temperature
-        top_k: Top-k sampling parameter
-        top_p: Nucleus sampling parameter
-        repetition_penalty: Penalty for token repetition
-        device: Device to run generation on
-    
-    Returns:
-        Dictionary with 'exact_match', 'partial_match', 'avg_length'
-    """
     if device is None:
         device = next(model.parameters()).device
-    
     exact_matches = 0
     partial_matches = 0
     total_length = 0
-    
     for prompt, expected in test_prompts:
         generated = generate_samples(
             model, tokenizer, [prompt],
@@ -279,26 +156,17 @@ def evaluate_generation_quality(
             repetition_penalty=repetition_penalty,
             device=device
         )[0]
-        
         total_length += len(generated)
-        
         if generated.strip() == expected.strip():
             exact_matches += 1
         elif expected.strip() in generated.strip():
             partial_matches += 1
-    
     n = len(test_prompts)
     return {
         'exact_match_rate': exact_matches / n if n > 0 else 0,
         'partial_match_rate': partial_matches / n if n > 0 else 0,
         'avg_generation_length': total_length / n if n > 0 else 0,
     }
-
-
-# -----------------------------------------------------------------------------
-# Benchmarking
-# -----------------------------------------------------------------------------
-
 @torch.no_grad()
 def benchmark_forward_pass(
     model: nn.Module,
@@ -309,25 +177,12 @@ def benchmark_forward_pass(
     num_warmup: int = 10,
     num_runs: int = 50
 ) -> Dict[str, float]:
-    """
-    Benchmark forward pass throughput.
-    
-    Returns:
-        Dictionary with 'avg_time_ms', 'std_time_ms', 'throughput_tok_per_sec'
-    """
     model.eval()
-    
-    # Create dummy input
     x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-    
-    # Warmup
     for _ in range(num_warmup):
         _ = model(x)
-    
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    
-    # Measure
     times = []
     for _ in range(num_runs):
         start = time.perf_counter()
@@ -335,20 +190,16 @@ def benchmark_forward_pass(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         end = time.perf_counter()
-        times.append((end - start) * 1000)  # ms
-    
+        times.append((end - start) * 1000)  
     avg_time = sum(times) / len(times)
     std_time = (sum((t - avg_time) ** 2 for t in times) / len(times)) ** 0.5
-    throughput = (batch_size * seq_len) / (avg_time / 1000)  # tokens per second
-    
+    throughput = (batch_size * seq_len) / (avg_time / 1000)  
     model.train()
     return {
         'avg_time_ms': avg_time,
         'std_time_ms': std_time,
         'throughput_tok_per_sec': throughput,
     }
-
-
 @torch.no_grad()
 def benchmark_forward_backward(
     model: nn.Module,
@@ -359,28 +210,15 @@ def benchmark_forward_backward(
     num_warmup: int = 10,
     num_runs: int = 50
 ) -> Dict[str, float]:
-    """
-    Benchmark forward+backward pass throughput.
-    
-    Returns:
-        Dictionary with 'avg_time_ms', 'throughput_tok_per_sec'
-    """
     model.train()
-    
-    # Create dummy input and targets
     x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
     y = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-    
-    # Warmup
     for _ in range(num_warmup):
         logits, loss, _ = model(x, y)
         loss.backward()
         model.zero_grad()
-    
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    
-    # Measure
     times = []
     for _ in range(num_runs):
         start = time.perf_counter()
@@ -391,27 +229,14 @@ def benchmark_forward_backward(
             torch.cuda.synchronize()
         end = time.perf_counter()
         times.append((end - start) * 1000)
-    
     avg_time = sum(times) / len(times)
     throughput = (batch_size * seq_len) / (avg_time / 1000)
-    
     model.eval()
     return {
         'avg_time_ms': avg_time,
         'throughput_tok_per_sec': throughput,
     }
-
-
-# -----------------------------------------------------------------------------
-# Full evaluation suite
-# -----------------------------------------------------------------------------
-
 class Evaluator:
-    """
-    Comprehensive evaluator for PowerGPT models.
-    Handles loss evaluation, generation, benchmarking, and logging.
-    """
-    
     def __init__(
         self,
         model: nn.Module,
@@ -427,51 +252,42 @@ class Evaluator:
         self.distributed = distributed
         self.rank = get_rank()
         self.timer = Timer()
-    
     def evaluate_loss(
         self,
         dataloader,
         eval_iters: int = 200
     ) -> float:
-        """Evaluate loss on validation set."""
         return evaluate_loss(
             self.model, dataloader, self.ctx, self.device,
             eval_iters, self.distributed
         )
-    
     def evaluate_perplexity(
         self,
         dataloader,
         eval_iters: int = 200
     ) -> float:
-        """Evaluate perplexity on validation set."""
         return evaluate_perplexity(
             self.model, dataloader, self.ctx, self.device,
             eval_iters, self.distributed
         )
-    
     def evaluate_accuracy(
         self,
         dataloader,
         eval_iters: int = 200
     ) -> float:
-        """Evaluate token accuracy on validation set."""
         return evaluate_accuracy(
             self.model, dataloader, self.ctx, self.device,
             eval_iters, self.distributed
         )
-    
     def evaluate_all(
         self,
         dataloader,
         eval_iters: int = 200
     ) -> Dict[str, float]:
-        """Evaluate all metrics."""
         return evaluate_all_metrics(
             self.model, dataloader, self.ctx, self.device,
             eval_iters, self.distributed
         )
-    
     def generate_samples(
         self,
         prompts: List[str],
@@ -482,13 +298,11 @@ class Evaluator:
         repetition_penalty: float = 1.1,
         use_kv_cache: bool = True
     ) -> List[str]:
-        """Generate text samples from prompts."""
         return generate_samples(
             self.model, self.tokenizer, prompts,
             max_new_tokens, temperature, top_k, top_p,
             repetition_penalty, use_kv_cache, self.device
         )
-    
     def benchmark_forward(
         self,
         batch_size: int,
@@ -496,13 +310,11 @@ class Evaluator:
         num_warmup: int = 10,
         num_runs: int = 50
     ) -> Dict[str, float]:
-        """Benchmark forward pass throughput."""
         return benchmark_forward_pass(
             self.model, batch_size, seq_len,
             self.model.config.vocab_size, self.device,
             num_warmup, num_runs
         )
-    
     def benchmark_forward_backward(
         self,
         batch_size: int,
@@ -510,13 +322,11 @@ class Evaluator:
         num_warmup: int = 10,
         num_runs: int = 50
     ) -> Dict[str, float]:
-        """Benchmark forward+backward throughput."""
         return benchmark_forward_backward(
             self.model, batch_size, seq_len,
             self.model.config.vocab_size, self.device,
             num_warmup, num_runs
         )
-    
     def run_full_evaluation(
         self,
         dataloader,
@@ -525,26 +335,15 @@ class Evaluator:
         benchmark_batch_sizes: List[int] = [1, 2, 4, 8],
         seq_len: int = 512
     ) -> Dict[str, Any]:
-        """
-        Run complete evaluation suite.
-        
-        Returns:
-            Dictionary with all evaluation results
-        """
         results = {}
-        
-        # Loss and perplexity
         self.timer.reset()
         metrics = self.evaluate_all(dataloader, eval_iters)
         results['metrics'] = metrics
         results['eval_time_s'] = self.timer.elapsed()
-        
         if is_main_process():
             print(f"\n[EVAL] Loss: {metrics['loss']:.4f}")
             print(f"[EVAL] Perplexity: {metrics['perplexity']:.2f}")
             print(f"[EVAL] Accuracy: {metrics['accuracy']:.4f}")
-        
-        # Generation quality
         if test_prompts and is_main_process():
             self.timer.reset()
             gen_metrics = evaluate_generation_quality(
@@ -555,8 +354,6 @@ class Evaluator:
             results['generation_time_s'] = self.timer.elapsed()
             print(f"[EVAL] Exact match: {gen_metrics['exact_match_rate']:.2%}")
             print(f"[EVAL] Partial match: {gen_metrics['partial_match_rate']:.2%}")
-        
-        # Benchmark
         if is_main_process():
             results['benchmark'] = {}
             for bs in benchmark_batch_sizes:
@@ -564,10 +361,8 @@ class Evaluator:
                 fwd = self.benchmark_forward(bs, seq_len)
                 results['benchmark'][f'forward_bs{bs}'] = fwd
                 print(f"[BENCH] Forward BS={bs}: {fwd['throughput_tok_per_sec']:.0f} tok/s")
-                
                 self.timer.reset()
                 fwd_bwd = self.benchmark_forward_backward(bs, seq_len)
                 results['benchmark'][f'forward_backward_bs{bs}'] = fwd_bwd
                 print(f"[BENCH] Forward+Backward BS={bs}: {fwd_bwd['throughput_tok_per_sec']:.0f} tok/s")
-        
         return results

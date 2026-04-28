@@ -1,7 +1,3 @@
-"""
-Data pipeline with memory-mapped datasets and distributed sharding.
-"""
-
 import os
 import random
 import numpy as np
@@ -10,8 +6,6 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info
 import tiktoken
-
-
 class TokenizerWrapper:
     _instance = None
     def __new__(cls, encoding='gpt2'):
@@ -23,8 +17,6 @@ class TokenizerWrapper:
     def decode(self, tokens): return self.tokenizer.decode(tokens)
     @property
     def vocab_size(self): return self.tokenizer.n_vocab
-
-
 class MMapTokenizedDataset(IterableDataset):
     def __init__(self, data_dir, block_size, split='train', seed=42, shuffle=True):
         self.data_dir = data_dir
@@ -63,12 +55,9 @@ class MMapTokenizedDataset(IterableDataset):
                 x = torch.from_numpy(chunk[:-1].astype(np.int64))
                 y = torch.from_numpy(chunk[1:].astype(np.int64))
                 yield x, y
-
-
 def create_dataloaders(model_config, training_config, distributed=False):
     train_ds = MMapTokenizedDataset(training_config.data_dir, model_config.block_size, 'train', training_config.seed)
     val_ds = MMapTokenizedDataset(training_config.data_dir, model_config.block_size, 'val', training_config.seed, shuffle=False)
-    # Для распределённого обучения отключаем workers
     if distributed:
         num_workers = 0
         persistent = False

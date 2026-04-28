@@ -1,77 +1,42 @@
-"""
-GPT model from scratch with FlashAttention-2, Rotary Positional Embeddings,
-Mixture of Experts, KV cache with sliding window, and gradient checkpointing.
-"""
-
 import math
 from typing import Optional, Tuple, List
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# Импорт конфигурации из правильного модуля
 from .config import ModelArchConfig
-
-# FlashAttention import с graceful fallback
 try:
     from flash_attn import flash_attn_func
     FLASH_ATTENTION_AVAILABLE = True
 except ImportError:
     FLASH_ATTENTION_AVAILABLE = False
-    print("[INFO] FlashAttention not installed. Using manual attention.")
-
-
-# -----------------------------------------------------------------------------
-# Core building blocks: RMSNorm, LayerNorm, RoPE, Activations
-# -----------------------------------------------------------------------------
-
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (faster than LayerNorm)."""
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
         return self.weight * (x / rms)
-
-
 class LayerNorm(nn.Module):
-    """Standard LayerNorm with bias option."""
     def __init__(self, dim: int, bias: bool = True, eps: float = 1e-5):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.bias = nn.Parameter(torch.zeros(dim)) if bias else None
         self.eps = eps
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.layer_norm(x, self.weight.shape, self.weight, self.bias, self.eps)
-
-
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotate half the hidden dims for RoPE."""
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
-
-
 def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor,
                          cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply rotary positional embeddings to query and key.
-    Supports both (B, T, nh, hd) and (B, nh, T, hd) layouts.
-    """
     if q.dim() == 4 and q.shape[2] == cos.shape[2]:
         cos = cos.transpose(1, 2)
         sin = sin.transpose(1, 2)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
-
 class RotaryEmbedding(nn.Module):
-    """Rotary Positional Embeddings with FP32 computation for numerical stability."""
     def __init__(self, dim: int, max_seq_len: int = 4096, base: float = 10000.0):
         super().__init__()
         self.dim = dim
@@ -82,7 +47,6 @@ class RotaryEmbedding(nn.Module):
         self._seq_len_cached = 0
         self._cos_cached = None
         self._sin_cached = None
-
     def _update_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
         if seq_len <= self._seq_len_cached:
             return
@@ -94,7 +58,6 @@ class RotaryEmbedding(nn.Module):
         self._cos_cached = cos
         self._sin_cached = sin
         self._seq_len_cached = seq_len
-
     def forward(self, q: torch.Tensor, k: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         self._update_cache(seq_len, q.device, q.dtype)
         if q.dim() == 4 and q.shape[2] == seq_len:
@@ -104,31 +67,18 @@ class RotaryEmbedding(nn.Module):
             cos = self._cos_cached
             sin = self._sin_cached
         return cos, sin
-
-
 class SwiGLU(nn.Module):
-    """SwiGLU activation: Swish(xW1) * (xW2) then projection."""
     def __init__(self, dim: int, hidden_dim: Optional[int] = None, bias: bool = True):
         super().__init__()
         hidden_dim = hidden_dim or 4 * dim
         self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
         self.w2 = nn.Linear(dim, hidden_dim, bias=bias)
         self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
-
-
 class GELU(nn.Module):
-    """GELU activation (legacy, slower than SwiGLU)."""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.gelu(x)
-
-
-# -----------------------------------------------------------------------------
-# Mixture of Experts (MoE) layer with load balancing
-# -----------------------------------------------------------------------------
-
 class MoERouter(nn.Module):
     def __init__(self, dim: int, num_experts: int, top_k: int):
         super().__init__()
@@ -136,14 +86,11 @@ class MoERouter(nn.Module):
         self.top_k = top_k
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.router_scale = nn.Parameter(torch.ones(1))
-
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         logits = self.gate(x) * self.router_scale
         weights, indices = torch.topk(logits, self.top_k, dim=-1)
         weights = F.softmax(weights, dim=-1)
         return weights, indices
-
-
 class MoELayer(nn.Module):
     def __init__(self, dim: int, num_experts: int, top_k: int,
                  hidden_dim: Optional[int] = None, bias: bool = True):
@@ -156,7 +103,6 @@ class MoELayer(nn.Module):
         ])
         self.register_buffer("expert_counts", torch.zeros(num_experts))
         self.load_balance_loss = torch.tensor(0.0, requires_grad=True)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
         x_flat = x.view(B * T, C)
@@ -180,12 +126,6 @@ class MoELayer(nn.Module):
         router_probs = torch.softmax(self.router.gate.weight, dim=-1).mean(0)
         self.load_balance_loss = torch.sum(fraction_per_expert * router_probs) * self.num_experts
         return y_flat.view(B, T, C)
-
-
-# -----------------------------------------------------------------------------
-# FlashAttention with KV cache
-# -----------------------------------------------------------------------------
-
 class FlashAttention(nn.Module):
     def __init__(self, config: ModelArchConfig):
         super().__init__()
@@ -202,7 +142,6 @@ class FlashAttention(nn.Module):
             self.rope = RotaryEmbedding(self.head_dim, max_seq_len=config.block_size, base=config.rope_theta)
         else:
             self.rope = None
-
     def forward(self, x: torch.Tensor,
                 past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache: bool = False,
@@ -236,12 +175,6 @@ class FlashAttention(nn.Module):
             attn_weights = F.dropout(attn_weights, p=self.dropout if self.training else 0.0)
             attn_out = (attn_weights @ v).transpose(1, 2).reshape(B, T, C)
         return self.out_proj(attn_out), new_kv
-
-
-# -----------------------------------------------------------------------------
-# Transformer Block (supports both regular MLP and MoE)
-# -----------------------------------------------------------------------------
-
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelArchConfig, layer_idx: int):
         super().__init__()
@@ -265,7 +198,6 @@ class TransformerBlock(nn.Module):
                 )
         self.dropout = nn.Dropout(config.dropout)
         self.layer_idx = layer_idx
-
     def forward(self, x: torch.Tensor,
                 past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache: bool = False) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
@@ -274,12 +206,6 @@ class TransformerBlock(nn.Module):
         mlp_out = self.mlp(self.norm2(x))
         x = x + self.dropout(mlp_out)
         return x, new_kv
-
-
-# -----------------------------------------------------------------------------
-# Full GPT Model
-# -----------------------------------------------------------------------------
-
 class GPT(nn.Module):
     def __init__(self, config: ModelArchConfig):
         super().__init__()
@@ -291,13 +217,12 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([TransformerBlock(config, i) for i in range(config.n_layer)])
         self.norm = RMSNorm(config.n_embd) if config.use_rms_norm else LayerNorm(config.n_embd, bias=config.bias)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.token_embedding.weight = self.lm_head.weight  # weight tying
+        self.token_embedding.weight = self.lm_head.weight
         self._gradient_checkpointing = config.gradient_checkpointing
         self.apply(self._init_weights)
         for name, param in self.named_parameters():
             if 'c_proj.weight' in name or 'w3.weight' in name:
                 torch.nn.init.normal_(param, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
-
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -309,7 +234,6 @@ class GPT(nn.Module):
             if hasattr(module, 'bias') and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
-
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None,
                 past_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
@@ -332,12 +256,11 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, label_smoothing=0.0)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             if self.config.use_moe:
                 moe_loss = sum(block.mlp.load_balance_loss for block in self.blocks if hasattr(block.mlp, 'load_balance_loss'))
                 loss = loss + 0.01 * moe_loss
         return logits, loss, new_past_kv if use_cache else None
-
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int,
                  temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0,
@@ -376,13 +299,10 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
-
     def gradient_checkpointing_enable(self):
         self._gradient_checkpointing = True
-
     def gradient_checkpointing_disable(self):
         self._gradient_checkpointing = False
-
     def configure_optimizers(self, weight_decay: float, learning_rate: float,
                              betas: Tuple[float, float], optimizer_type: str = 'adamw'):
         decay_params = []
@@ -399,23 +319,21 @@ class GPT(nn.Module):
             {'params': no_decay_params, 'weight_decay': 0.0}
         ]
         if optimizer_type == 'adamw':
-            if hasattr(torch.optim, 'AdamW') and hasattr(torch.optim.AdamW, 'fused'):
+            try:
                 return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=True)
-            else:
+            except (RuntimeError, AttributeError):
                 return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         elif optimizer_type == 'lamb':
             try:
                 from torch_optimizer import Lamb
                 return Lamb(optim_groups, lr=learning_rate, betas=betas, weight_decay=weight_decay)
             except ImportError:
-                print("[WARN] torch-optimizer not installed, falling back to AdamW")
                 return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         elif optimizer_type == 'lion':
             try:
                 from lion_pytorch import Lion
                 return Lion(optim_groups, lr=learning_rate, betas=betas, weight_decay=weight_decay)
             except ImportError:
-                print("[WARN] lion-pytorch not installed, falling back to AdamW")
                 return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         else:
             raise ValueError(f"Unknown optimizer type: {optimizer_type}")

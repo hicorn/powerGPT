@@ -1,15 +1,9 @@
-"""
-Configuration management for PowerGPT.
-"""
-
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Literal, Tuple
 import torch
 import yaml
 import os
 import argparse
-
-
 @dataclass
 class ModelArchConfig:
     vocab_size: int = 50257
@@ -29,12 +23,9 @@ class ModelArchConfig:
     top_k_experts: int = 2
     gradient_checkpointing: bool = True
     use_compile: bool = False
-
     def __post_init__(self):
         assert self.n_embd % self.n_head == 0
         self.head_dim = self.n_embd // self.n_head
-
-
 @dataclass
 class TrainingConfig:
     data_dir: str = "data"
@@ -70,12 +61,9 @@ class TrainingConfig:
     pin_memory: bool = True
     persistent_workers: bool = False
     profile: bool = False
-
     @property
     def effective_batch_size(self) -> int:
         return self.micro_batch_size * self.gradient_accumulation_steps
-
-
 @dataclass
 class InferenceConfig:
     max_new_tokens: int = 512
@@ -90,8 +78,6 @@ class InferenceConfig:
     use_kv_cache: bool = True
     max_kv_cache_tokens: int = 2048
     batch_size: int = 1
-
-
 @dataclass
 class BenchmarkConfig:
     seq_lengths: Tuple[int, ...] = (128, 256, 512, 1024)
@@ -100,15 +86,12 @@ class BenchmarkConfig:
     num_runs: int = 50
     profile_memory: bool = True
     output_json: Optional[str] = None
-
-
 class ConfigManager:
     def __init__(self):
         self.model = ModelArchConfig()
         self.training = TrainingConfig()
         self.inference = InferenceConfig()
         self.benchmark = BenchmarkConfig()
-
     def load_yaml(self, path: str) -> 'ConfigManager':
         if not os.path.exists(path):
             raise FileNotFoundError(f"Config file not found: {path}")
@@ -131,40 +114,26 @@ class ConfigManager:
                 if hasattr(self.benchmark, k):
                     setattr(self.benchmark, k, v)
         return self
-
     def validate(self) -> 'ConfigManager':
         if not os.path.exists(self.training.data_dir):
             print(f"[WARN] Data directory {self.training.data_dir} does not exist")
         return self
-
     def to_dict(self) -> Dict[str, Any]:
         return {
             'model': self.model.__dict__,
             'training': self.training.__dict__,
             'inference': self.inference.__dict__,
         }
-
-
-# -----------------------------------------------------------------------------
-# Вспомогательные функции для CLI
-# -----------------------------------------------------------------------------
-
 def add_config_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Add configuration-related arguments to an argparse parser."""
     parser.add_argument('--config', type=str, required=True, help='Path to YAML config file')
     parser.add_argument('--output_dir', type=str, default=None, help='Override output directory')
     parser.add_argument('--max_iters', type=int, default=None, help='Override max iterations')
     parser.add_argument('--batch_size', type=int, default=None, help='Override micro batch size')
     parser.add_argument('--learning_rate', type=float, default=None, help='Override learning rate')
     return parser
-
-
 def load_config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
-    """Load config from YAML file and override with CLI args."""
     with open(args.config, 'r') as f:
         config_data = yaml.safe_load(f)
-    
-    # Применить переопределения из командной строки
     if args.output_dir:
         config_data.setdefault('training', {})['output_dir'] = args.output_dir
     if args.max_iters:
@@ -173,5 +142,4 @@ def load_config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         config_data.setdefault('training', {})['micro_batch_size'] = args.batch_size
     if args.learning_rate:
         config_data.setdefault('training', {})['learning_rate'] = args.learning_rate
-    
     return config_data

@@ -237,7 +237,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='PowerGPT - Optimized GPT Training and Inference',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=
+        epilog="Example: powergpt train --config configs/tiny_shakespeare.yaml"
     )
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
     train_parser = subparsers.add_parser('train', help='Train a model')

@@ -224,7 +224,7 @@ class Trainer:
     def evaluate(self) -> float:
         self.model.eval()
         losses = []
-        eval_iters = min(self.config.training.eval_iters, len(self.val_loader))
+        eval_iters = self.config.training.eval_iters
         for i, (x, y) in enumerate(self.val_loader):
             if i >= eval_iters:
                 break

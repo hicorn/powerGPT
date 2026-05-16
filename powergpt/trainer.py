@@ -1,12 +1,12 @@
+
 import os
 import sys
 import time
 import math
 import argparse
 import signal
-import traceback
 from contextlib import nullcontext
-from typing import Optional, Dict, Any, Tuple, List, Union
+from typing import Optional, Tuple
 from dataclasses import asdict
 import torch
 import torch.nn as nn
@@ -30,7 +30,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 import wandb
-from .config import ConfigManager, ModelArchConfig, TrainingConfig
+from .config import ConfigManager
 from .model import GPT, TransformerBlock
 from .data_pipeline import create_dataloaders
 from .optimizer import create_optimizer, get_lr_schedule
@@ -38,8 +38,6 @@ from .utils import (
     set_seed,
     save_checkpoint,
     load_checkpoint,
-    evaluate_loss,
-    log_metrics,
     cleanup_distributed,
     get_rank,
     get_world_size,
@@ -48,11 +46,13 @@ from .utils import (
     format_time,
     get_gpu_memory_map,
 )
+
 try:
     from peft import LoraConfig, get_peft_model, TaskType
     PEFT_AVAILABLE = True
 except ImportError:
     PEFT_AVAILABLE = False
+
 class Trainer:
     def __init__(self, config: ConfigManager, local_rank: int = -1):
         self.config = config
@@ -79,6 +79,7 @@ class Trainer:
         signal.signal(signal.SIGTERM, self._signal_handler)
         if is_main_process():
             self._print_config()
+
     def _setup_distributed(self):
         if self.is_distributed:
             torch.cuda.set_device(self.local_rank)
@@ -88,6 +89,7 @@ class Trainer:
         else:
             self.world_size = 1
             self.rank = 0
+
     def _setup_mixed_precision(self):
         dtype_str = self.config.training.dtype
         if dtype_str == 'fp16':
@@ -99,6 +101,7 @@ class Trainer:
         else:
             self.dtype = torch.float32
             self.ctx = nullcontext()
+
     def _setup_model(self):
         model = GPT(self.config.model)
         model.to(self.device)
@@ -134,6 +137,7 @@ class Trainer:
             self.model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
         else:
             self.model = model
+
     def _apply_lora_if_needed(self):
         use_lora = getattr(self.config.training, 'use_lora', False)
         if not use_lora:
@@ -151,14 +155,14 @@ class Trainer:
         )
         peft_model = get_peft_model(raw_model, lora_config)
         self.raw_model = peft_model
-        if isinstance(self.model, (FSDP, DDP)):
-            pass
         self.model = peft_model
+
     def _setup_optimizer(self):
         raw_model = getattr(self, 'raw_model', self.model)
         if isinstance(raw_model, (FSDP, DDP)):
             raw_model = raw_model.module
         self.optimizer = create_optimizer(raw_model, self.config.training)
+
     def _setup_data(self):
         self.train_loader, self.val_loader = create_dataloaders(
             self.config.model,
@@ -166,6 +170,7 @@ class Trainer:
             distributed=self.is_distributed
         )
         self.train_iter = iter(self.train_loader)
+
     def _setup_logging(self):
         if is_main_process():
             log_dir = os.path.join(self.config.training.output_dir, 'logs')
@@ -189,13 +194,16 @@ class Trainer:
         else:
             self.writer = None
             self.wandb_log = False
+
     def _print_config(self):
         pass
+
     def _signal_handler(self, sig, frame):
         if is_main_process():
             self.save_checkpoint(is_best=False)
         cleanup_distributed()
         sys.exit(0)
+
     def train_step(self, micro_batch: Tuple[torch.Tensor, torch.Tensor]) -> float:
         x, y = micro_batch
         x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
@@ -207,6 +215,7 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             return 0.0
         return loss.item() * self.config.training.gradient_accumulation_steps
+
     def optimizer_step(self, lr: float):
         if (self.iter_num + 1) % self.config.training.gradient_accumulation_steps == 0:
             self.scaler.unscale_(self.optimizer)
@@ -221,6 +230,7 @@ class Trainer:
                 self.config.training.gradient_accumulation_steps *
                 self.config.model.block_size
             )
+
     def evaluate(self) -> float:
         self.model.eval()
         losses = []
@@ -241,6 +251,7 @@ class Trainer:
             mean_loss = loss_tensor.item() / self.world_size
         self.model.train()
         return mean_loss
+
     def save_checkpoint(self, is_best: bool = False):
         if not is_main_process():
             return
@@ -268,6 +279,7 @@ class Trainer:
         if is_best:
             best_path = os.path.join(self.config.training.output_dir, 'best_model.pt')
             torch.save(checkpoint, best_path)
+
     def load_checkpoint(self, checkpoint_path: str):
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -286,6 +298,7 @@ class Trainer:
         self.epoch = checkpoint.get('epoch', 0)
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         self.total_tokens_processed = checkpoint.get('total_tokens_processed', 0)
+
     def log_metrics(self, loss: float, lr: float, tokens_per_sec: float):
         if not is_main_process():
             return
@@ -306,12 +319,14 @@ class Trainer:
                 'total_tokens': self.total_tokens_processed,
                 'iter': self.iter_num,
             }, step=self.iter_num)
+
     def log_eval(self, val_loss: float):
         if not is_main_process():
             return
         self.writer.add_scalar('val/loss', val_loss, self.iter_num)
         if self.wandb_log:
             wandb.log({'val_loss': val_loss}, step=self.iter_num)
+
     def log_memory(self):
         if not is_main_process():
             return
@@ -319,6 +334,7 @@ class Trainer:
             mem_map = get_gpu_memory_map()
             self.writer.add_scalar('memory/used_gb', mem_map.get('allocated_gb', 0), self.iter_num)
             self.last_memory_log = self.iter_num
+
     def train(self, resume_from: Optional[str] = None):
         set_seed(self.config.training.seed)
         if resume_from:
@@ -338,10 +354,12 @@ class Trainer:
                 dt = time.time() - self.start_time
                 tokens_per_sec = self.total_tokens_processed / dt if dt > 0 else 0
                 self.log_metrics(loss_scalar, lr, tokens_per_sec)
+                print(f"[GPU] Step {self.iter_num}: loss = {loss_scalar:.4f}, lr = {lr:.6f}")
                 self.start_time = time.time()
             if is_main_process() and self.iter_num % self.config.training.eval_interval == 0 and self.iter_num > 0:
                 val_loss = self.evaluate()
                 self.log_eval(val_loss)
+                print(f"[GPU] Step {self.iter_num}: val_loss = {val_loss:.4f}")
                 if val_loss < self.best_val_loss and self.config.training.save_best:
                     self.best_val_loss = val_loss
                     self.save_checkpoint(is_best=True)
@@ -355,6 +373,7 @@ class Trainer:
             if self.wandb_log:
                 wandb.finish()
         cleanup_distributed()
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/t4_124m.yaml')
@@ -364,5 +383,6 @@ def main():
     config = ConfigManager().load_yaml(args.config).validate()
     trainer = Trainer(config, local_rank=args.local_rank)
     trainer.train(resume_from=args.resume)
+
 if __name__ == '__main__':
     main()
